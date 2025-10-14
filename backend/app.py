@@ -3,15 +3,6 @@ from flask_cors import CORS
 import google.generativeai as genai
 import os
 from dotenv import load_dotenv
-import os
-from flask import Flask
-
-def load_environment_variables():
-    if os.path.exists('.env'):
-        with open('.env', 'r') as file:
-            for line in file:
-                key, value = line.strip().split('=')
-                os.environ[key] = value
 import json
 
 # Load environment variables from .env file
