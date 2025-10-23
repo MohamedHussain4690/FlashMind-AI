@@ -1,162 +1,149 @@
+import os
+import io
+import json
+import re
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import google.generativeai as genai
-import os
 from dotenv import load_dotenv
-import json
+from werkzeug.utils import secure_filename
+import PyPDF2
+from docx import Document
+import google.generativeai as genai
 
-# Load environment variables from .env file
 load_dotenv()
-
-# Initialize Flask app
 app = Flask(__name__)
-
-# Enable CORS (allows React frontend to communicate with Flask backend)
 CORS(app)
 
-# Configure Gemini AI with API key from .env file
-genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+MAX_FILES = 2
+MAX_FILE_SIZE_MB = 10
+app.config['MAX_CONTENT_LENGTH'] = (MAX_FILES * MAX_FILE_SIZE_MB * 1024 * 1024) + (1024 * 1024)
+ALLOWED_EXTENSIONS = {'pdf', 'docx'}
 
-# Initialize Gemini model
-model = genai.GenerativeModel('gemini-1.5-flash')
+try:
+    api_key = os.getenv('GEMINI_API_KEY')
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY not found in .env file.")
+    genai.configure(api_key=api_key)
+    
+    MODEL_NAME = 'gemini-2.5-flash-lite-preview-09-2025'
+    model = genai.GenerativeModel(MODEL_NAME)
+    print(f"✅ Gemini AI configured successfully with model: {MODEL_NAME}")
 
+except Exception as e:
+    print(f"❌ FAILED to configure Gemini AI: {e}")
+    model = None
+    MODEL_NAME = "Not Configured"
 
-# Root route - Test if backend is running
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def extract_text_from_pdf(file_stream):
+    try:
+        pdf_reader = PyPDF2.PdfReader(file_stream)
+        return "".join(page.extract_text() + "\n" for page in pdf_reader.pages).strip()
+    except Exception as e:
+        print(f"❌ PDF Extraction Error: {e}")
+        raise ValueError(f"Could not read the PDF file. It might be corrupted or encrypted.")
+
+def extract_text_from_docx(file_stream):
+    try:
+        doc = Document(file_stream)
+        return "\n".join(para.text for para in doc.paragraphs).strip()
+    except Exception as e:
+        print(f"❌ DOCX Extraction Error: {e}")
+        raise ValueError(f"Could not read the DOCX file.")
+
 @app.route('/')
 def home():
     return jsonify({
         'message': 'AI Flashcard Generator API is running!',
-        'status': 'success',
-        'endpoints': {
-            '/generate': 'POST - Generate flashcards'
-        }
+        'status': 'success' if model else 'error',
+        'model_in_use': MODEL_NAME
     })
 
-
-# Generate flashcards route
 @app.route('/generate', methods=['POST'])
 def generate_flashcards():
+    if not model:
+        return jsonify({'error': 'AI model is not configured. Check server logs.'}), 503
+
     try:
-        # Get data from frontend request
-        data = request.json
-        topic = data.get('topic', '')
-        content = data.get('content', '')
-        num_cards = data.get('num_cards', 5)
-
-        # Validate input - topic is required
+        uploaded_files = request.files.getlist('files')
+        
+        topic = request.form.get('topic', '')
+        content = request.form.get('content', '')
+        num_cards = int(request.form.get('num_cards', 5))
+        
+        print(f"Received request for topic: '{topic}' with {len(uploaded_files)} file(s).")
+        
         if not topic:
-            return jsonify({'error': 'Topic is required'}), 400
+            return jsonify({'error': 'Topic is required.'}), 400
 
-        # Create AI prompt based on whether content is provided
-        if content:
-            # User provided study material
+        extracted_texts = []
+        if len(uploaded_files) > 0 and uploaded_files[0].filename != '':
+            if len(uploaded_files) > MAX_FILES:
+                return jsonify({'error': f'Cannot upload more than {MAX_FILES} files.'}), 400
+
+            for file in uploaded_files:
+                if not (file and allowed_file(file.filename)):
+                    return jsonify({'error': f'Invalid file type or name: {file.filename}'}), 400
+                
+                file_stream = io.BytesIO(file.read())
+                ext = file.filename.rsplit('.', 1)[1].lower()
+                
+                if ext == 'pdf': text = extract_text_from_pdf(file_stream)
+                elif ext == 'docx': text = extract_text_from_docx(file_stream)
+                
+                extracted_texts.append(text)
+                print(f"✅ Extracted {len(text)} chars from {file.filename}")
+
+        final_content = content
+        if extracted_texts:
+            files_content = "\n\n--- Document Content ---\n\n".join(extracted_texts)
+            final_content = f"{content}\n\n{files_content}".strip()
+
+
+        if final_content:
             prompt = f"""
-            You are an expert educator. Generate exactly {num_cards} educational flashcards based on the following topic and content.
-            
-            Topic: {topic}
-            Content: {content}
-            
-            Create {num_cards} question-answer pairs that test key concepts from the content.
-            
-            IMPORTANT: You must respond with ONLY a valid JSON array in this exact format:
-            [
-                {{"question": "What is the main concept of X?", "answer": "The main concept is Y"}},
-                {{"question": "How does Z work?", "answer": "Z works by doing A"}}
-            ]
-            
-            Rules:
-            1. Return ONLY the JSON array, nothing else
-            2. No markdown formatting, no code blocks, no explanations
-            3. Questions should be clear and specific
-            4. Answers should be concise but complete
-            5. Create exactly {num_cards} flashcards
+            System: You are a helpful assistant that generates educational materials.
+            User: Based on the topic "{topic}" and the provided content below, create exactly {num_cards} high-quality flashcards.
+
+            Content:
+            ---
+            {final_content[:15000]}
+            ---
+
+            Your task is to respond with ONLY a valid JSON array of objects. Each object must have a "question" and an "answer" key. Do not add any other text, explanations, or markdown formatting like ```json.
             """
         else:
-            # No content provided, generate from topic only
             prompt = f"""
-            You are an expert educator. Generate exactly {num_cards} educational flashcards about the topic: {topic}
-            
-            Create {num_cards} question-answer pairs that test key concepts about {topic}.
-            
-            IMPORTANT: You must respond with ONLY a valid JSON array in this exact format:
-            [
-                {{"question": "What is {topic}?", "answer": "A clear definition"}},
-                {{"question": "What are key features of {topic}?", "answer": "Key features include..."}}
-            ]
-            
-            Rules:
-            1. Return ONLY the JSON array, nothing else
-            2. No markdown formatting, no code blocks, no explanations
-            3. Questions should be clear and specific
-            4. Answers should be concise but complete
-            5. Create exactly {num_cards} flashcards
+            System: You are a helpful assistant that generates educational materials.
+            User: Create exactly {num_cards} flashcards about the topic: "{topic}".
+            Respond with ONLY a valid JSON array of objects, with "question" and "answer" keys.
             """
-
-        # Call Gemini AI to generate flashcards
-        print(f"Generating {num_cards} flashcards about: {topic}")
+        print(f"⏳ Calling Gemini API with model: {MODEL_NAME}...")
         response = model.generate_content(prompt)
-        
-        # Extract the response text
         response_text = response.text.strip()
-        print(f"AI Response: {response_text[:100]}...")  # Print first 100 chars for debugging
+        print(f"✅ Gemini Response Received. Length: {len(response_text)}")
 
-        # Clean up response (remove markdown code blocks if present)
-        if response_text.startswith('```'):
-            # Remove markdown code blocks
-            response_text = response_text.split('```')[1]
-            if response_text.startswith('json'):
-                response_text = response_text[4:]
-            response_text = response_text.strip()
+        match = re.search(r'\[.*\]', response_text, re.DOTALL)
+        if not match:
+            raise ValueError("No JSON array found in the AI response.")
+            
+        json_str = match.group(0)
+        flashcards = json.loads(json_str)
 
-        # Parse JSON response
-        flashcards = json.loads(response_text)
-        
-        # Validate that we got a list
         if not isinstance(flashcards, list):
-            raise ValueError("AI did not return a valid list of flashcards")
-        
-        # Ensure we have the right number of cards
-        flashcards = flashcards[:num_cards]
-        
-        # Validate each flashcard has question and answer
-        for card in flashcards:
-            if 'question' not in card or 'answer' not in card:
-                raise ValueError("Invalid flashcard format")
+            raise ValueError("AI response was not a valid list.")
+            
+        print(f"✅ Successfully parsed {len(flashcards)} flashcards.")
+        return jsonify({'success': True, 'flashcards': flashcards[:num_cards]})
 
-        # Return success response
-        print(f"Successfully generated {len(flashcards)} flashcards")
-        return jsonify({
-            'success': True,
-            'flashcards': flashcards,
-            'count': len(flashcards)
-        })
-
-    except json.JSONDecodeError as e:
-        # Handle JSON parsing errors
-        print(f"JSON Parse Error: {e}")
-        print(f"Raw response: {response_text}")
-        return jsonify({
-            'error': 'Failed to parse AI response. Please try again.',
-            'details': str(e)
-        }), 500
-    
     except Exception as e:
-        # Handle any other errors
-        print(f"Error: {str(e)}")
-        return jsonify({
-            'error': 'An error occurred while generating flashcards.',
-            'details': str(e)
-        }), 500
+        print(f"❌ AN ERROR OCCURRED: {type(e).__name__}: {e}")
+        if 'response_text' in locals():
+            print(f"--- RAW AI RESPONSE THAT CAUSED ERROR ---\n{response_text}\n---------------------------------------")
+        return jsonify({'error': 'An internal server error occurred. Please check the server logs for details.'}), 500
 
-
-# Run the Flask app
 if __name__ == '__main__':
-    # Get port from environment or use default 5000
     port = int(os.getenv('PORT', 5000))
-    
-    # Run server
-    app.run(
-        host='0.0.0.0',  # Makes server accessible from any IP
-        port=port,
-        debug=os.getenv('FLASK_DEBUG', 'True') == 'True'
-    )
+    app.run(host='0.0.0.0', port=port, debug=True)
